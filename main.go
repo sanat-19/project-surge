@@ -2,9 +2,11 @@ package main
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net/http"
+	"runtime"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -33,39 +35,61 @@ var (
 		},
 		[]string{"path"},
 	)
+
+	// Label values are fixed per handler, so resolve them once at startup
+	// instead of paying a map lookup on every request.
+	workDuration     = requestDuration.WithLabelValues("/work")
+	workRequestsOK   = requestsTotal.WithLabelValues("/work", "200")
+	healthRequestsOK = requestsTotal.WithLabelValues("/health", "200")
 )
 
-func doWork(rounds int) []byte {
+func doWork(rounds int) [32]byte {
 	sum := sha256.Sum256([]byte("surge"))
 	for i := 0; i < rounds; i++ {
 		sum = sha256.Sum256(sum[:])
 	}
-	return sum[:]
+	return sum
 }
 
 func workHandler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	result := doWork(intensity)
-	requestDuration.WithLabelValues("/work").Observe(time.Since(start).Seconds())
-	requestsTotal.WithLabelValues("/work", "200").Inc()
+	sum := doWork(intensity)
+	workDuration.Observe(time.Since(start).Seconds())
+	workRequestsOK.Inc()
+
+	var buf [2*len(sum) + 1]byte
+	hex.Encode(buf[:2*len(sum)], sum[:])
+	buf[2*len(sum)] = '\n'
 
 	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintf(w, "%x\n", result)
+	w.Write(buf[:])
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	requestsTotal.WithLabelValues("/health", "200").Inc()
+	healthRequestsOK.Inc()
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, "OK")
 }
 
 func main() {
+	// Explicit rather than relying on the implicit default, so the value is
+	// provable/loggable instead of assumed.
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/work", workHandler)
 	mux.HandleFunc("/health", healthHandler)
 	mux.Handle("/metrics", promhttp.Handler())
 
 	addr := ":8080"
-	log.Printf("surge listening on %s (intensity=%d)", addr, intensity)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	log.Printf("surge listening on %s (intensity=%d, GOMAXPROCS=%d)", addr, intensity, runtime.GOMAXPROCS(0))
+	log.Fatal(srv.ListenAndServe())
 }

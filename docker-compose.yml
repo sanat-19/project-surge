@@ -1,0 +1,8 @@
+services:
+  surge:
+    image: surge
+    container_name: surgeP1
+    build: 
+      context: .
+    ports:
+      - "8080:8080"

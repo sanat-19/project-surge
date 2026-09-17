@@ -5,8 +5,8 @@ services:
     cpuset: "0"
     build: 
       context: .
-    ports:
-      - "8080:8080"
+    expose:
+      - "8080"
 
   surge-2:
     image: surge
@@ -14,8 +14,8 @@ services:
     cpuset: "1"
     build: 
       context: .
-    ports:
-      - "8081:8080"
+    expose:
+      - "8080"
 
   surge-3:
     image: surge
@@ -23,5 +23,17 @@ services:
     cpuset: "2"
     build: 
       context: .
+    expose:
+      - "8080"
+
+  nginx:
+    image: nginx:alpine
     ports:
-      - "8082:8080"
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    cpuset: "3"
+    depends_on:
+      - surge-1
+      - surge-2
+      - surge-3

@@ -104,6 +104,53 @@ Retested at the same offered rate (20,000 req/sec) as the worst Phase 0 case:
 
 2 of 3 sampled cores show the ~1,200 ceiling; core 1 is a clear positive outlier. Root cause not conclusively identified — candidates include the machine's heterogeneous 6-performance/2-efficiency core architecture, core 0 conventionally absorbing a disproportionate share of interrupt/kernel overhead on Linux, and/or Apple's Virtualization Framework (which backs Docker Desktop's Linux VM on macOS) not guaranteeing a stable 1:1 mapping between a container's pinned `cpuset` index and a specific physical core run-to-run. Not fully diagnosable from inside the VM with tools available here. **Treating ~1,200 req/sec/core as the conservative working number** for later math, and flagging that a "good" core isn't guaranteed to stay in the same place if containers are re-pinned later.
 
-**Next:** add nginx in front of all three containers (switching backends from `ports` to `expose`-only) and re-test through nginx's single address to compare actual combined throughput against the ~3,600 theoretical linear estimate (3 × ~1,200) — keeping in mind the per-core parity issue means real combined throughput could land anywhere from below to above that estimate depending on which physical cores the three containers actually land on.
+**nginx wired up and verified correct:** switched backends to `expose`-only (no host ports), added `nginx:alpine` service on host port 80, `nginx.conf` with a round-robin `upstream` block. Verified actual round-robin behavior directly via each backend's own `surge_requests_total` counter (bypassing nginx, over the internal Docker network): 30 requests through nginx landed exactly 10 on each of the 3 backends — confirmed even distribution.
+
+**Bottleneck found: default nginx `worker_connections` (512) is far too low.** First combined-throughput test at the offered 3,600 req/sec (3 × ~1,200 theoretical) collapsed badly: only 22.94% success, mix of raw connection errors (`EOF`, 41,405 of them) and genuine `500 Internal Server Error` responses (207) — confirmed via decoded response body to be nginx's *own* generated error page (`Server: nginx/1.31.6`, stock HTML), not anything from the Go backends. Root cause found directly in nginx's log at `[alert]` severity (not `[error]`/`[warn]`, easy to miss): `512 worker_connections are not enough`. Our `nginx.conf` never set `worker_processes`/`worker_connections` explicitly, so it fell back to the compiled-in default of 512 per worker — and since nginx holds open a separate upstream connection for every in-flight client connection, real concurrent connection usage is roughly double the client-side concurrency, blowing past 512 immediately at 800 concurrent test workers.
+
+**Fix:** added `worker_processes auto;` (top-level) and `events { worker_connections 4096; }` to `nginx.conf`. Retested at the same 3,600 req/sec offered rate: **100% success**, zero connection errors or 500s — the nginx-level bottleneck is fully resolved.
+
+**New finding: naive round-robin is bounded by the weakest backend, not the average.** Even after the nginx fix, throughput at 3,600 offered only reached 2,204.94 actual, with bimodal latency (p50 2ms, p90 1.1s). Explanation: round robin sends an equal ⅓ share to every backend regardless of real capacity. Since cores 0 and 2 cap around ~1,200 req/sec each (per the earlier per-core parity finding) while core 1 handles more, splitting 3,600 evenly sends exactly ~1,200 req/sec to each — right at the breaking point for the two weaker cores, while the strong core's share sails through fine. Round robin has no way to shift extra load to the capable backend, so the pool's *practical* ceiling is bounded by (weakest backend's ceiling) × (backend count), not the sum of each backend's individual capacity.
+
+**Investigating unexpectedly-bad pooled throughput:** even after the nginx fix, testing at 2,400 req/sec through nginx (only ~800/sec per backend — well under each backend's individually-measured ~1,200 ceiling) still showed heavy bimodal degradation (mean 253ms, p90 996ms, p99 1.27s), confirmed not a client-side artifact (throughput matched the offered rate exactly with 1,500 workers).
+
+**Bottleneck found: `cpuset` pins a container to a core, but doesn't reserve that core exclusively for it.** `nginx` had no `cpuset` of its own, so the Linux scheduler was free to run its worker processes on *any* core — including cores 0/1/2, directly competing with the pinned Go backends for the exact cores they depend on. This explained the bimodal pattern: traffic landing when nginx happened to be scheduled elsewhere sailed through fast, traffic overlapping with nginx's CPU usage on a shared core stalled badly.
+
+**Fix:** pinned `nginx` to its own dedicated core (`cpuset: "3"`, isolated from cores 0/1/2). Retested at the same 2,400 req/sec:
+
+| | Before (nginx unpinned) | After (nginx on core 3) |
+|---|---|---|
+| throughput | 2,258.72 | 2,399.86 (exact match) |
+| mean | 253.0ms | **2.24ms** (~113x better) |
+| p99 | 1.27s | 27.8ms |
+| max | 1.37s | 67.0ms |
+| success | 100% | 100% |
+
+**Takeaway for later phases:** every process sharing this machine (nginx, Prometheus/Grafana, the autoscaler, the load generator itself) needs its own explicit CPU budget separate from whatever cores the backends are pinned to — otherwise "isolated" per-container ceiling numbers measured standalone don't hold up once the full stack is running together. This is exactly the concern Phase 7 (observability isolation) calls out, surfacing here already in Phase 3.
+
+**Combined ceiling ramp (nginx isolated to core 3, backends on cores 0/1/2):**
+
+| Offered rate | Achieved throughput | mean | p99 | max | Success |
+|---|---|---|---|---|---|
+| 2,400 | 2,399.86 | 2.2ms | 27.8ms | 67.0ms | 100% |
+| 2,500 | 2,497.79 | 5.2ms | 64.9ms | 125.3ms | 100% |
+| 2,600 | 2,496.66 (self-throttled) | 83.4ms | 825.7ms | 1.38s | 100% |
+| 2,700 | 2,581.03 (self-throttled) | 146.4ms | 941.6ms | 1.0s | 100% |
+| 3,000 | 2,626.03 (self-throttled) | 422.8ms | 1.78s | 2.88s | 100% |
+| 3,600 | 2,472.52 | 689.0ms | 3.96s | 4.09s | 96.7% (worker_connections limit hit again at this concurrency) |
+
+**Phase 3 combined ceiling: ~2,500 req/sec** — vs. the naive linear estimate of ~3,600 (3 × ~1,200 per-core). That's roughly **70% scaling efficiency**, not the 100% a "just add more containers" mental model would predict. Two compounding reasons, both already diagnosed above: (1) round robin sends every backend an equal ⅓ share regardless of real capacity, so the two weaker cores (0 and 2, ~1,200 ceiling each) become the limiting factor rather than the pool's summed capacity; (2) nginx itself needs its own isolated CPU budget, or it silently steals cycles from whichever backend cores it happens to share.
+
+**Phase 3 summary table (for Phase 8's final report):**
+
+| Stage | Ceiling | Bottleneck found | Fix applied |
+|---|---|---|---|
+| Phase 0 (bare metal baseline) | ~17,000–18,000 req/sec | No `http.Server` timeouts → unbounded queueing under overload | Deferred to Phase 1 |
+| Phase 1 (backend tuning) | ~17,000–18,000 req/sec (unchanged) | N/A — timeouts bound worst-case latency, don't add capacity | `http.Server` timeouts, hot-path allocation cleanup, explicit `GOMAXPROCS` |
+| Phase 2 (single container) | ~6,000–6,500 req/sec | Docker Desktop macOS networking virtualization tax (~2.5-3x vs. bare metal, same CPU budget) | Documented; inherent to macOS Docker Desktop |
+| Phase 3 (per-core, isolated) | ~1,200 req/sec/core | Cores not interchangeable (heterogeneous P/E cores and/or VM scheduling variance); ~4x below the ~5k/core back-of-envelope guess | Measured empirically, corrected the estimate |
+| Phase 3 (3 containers + nginx) | ~2,500 req/sec | nginx default `worker_connections` (512) too low; nginx competing for CPU with pinned backend cores; round-robin bounded by weakest backend | `worker_connections`/`worker_processes` tuning; pinned nginx to its own core; documented round-robin's weakest-link limitation |
+
+**Next (Phase 4):** introduce the naive autoscaler — poll → threshold → spin up/down containers automatically, and expect to find the reaction-lag bottleneck the project brief predicts.
 
 **Notes on methodology:** back-to-back high-concurrency vegeta runs without a cooldown pause between them produced misleadingly worse numbers (client-side ephemeral port exhaustion from TCP `TIME_WAIT`, plus possible leftover queued connections on the server from the prior overload). Always allow ~30-60s between heavy load-test runs, and scale vegeta's `-max-workers`/`-connections` with the offered rate (roughly `rate × expected_latency`) so the load-test client itself doesn't become the bottleneck being measured.

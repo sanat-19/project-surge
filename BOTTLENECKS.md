@@ -78,6 +78,32 @@ Retested at the same offered rate (20,000 req/sec) as the worst Phase 0 case:
 
 **Container ceiling: ~6,000–6,500 req/sec**, vs. bare metal's ~17,000–18,000 (Phase 0/1) — roughly a **2.5–3x reduction** from containerizing identical code with identical CPU access (`GOMAXPROCS=8` confirmed both sides). This is a much sharper drop than the ~5x latency-only tax seen at light 5,000 req/sec load — the container doesn't just add fixed per-request latency, its actual sustainable *throughput* is capped well below bare metal. Consistent with the macOS Docker Desktop networking-virtualization hypothesis: that layer likely becomes a real concurrency/throughput bottleneck under load, not just a fixed per-packet latency add.
 
-**Next (Phase 3):** manually run N containers behind nginx to find the per-core ceiling empirically and validate/correct the back-of-envelope "~5k/core" estimate — now grounded against a real single-container number (~6,000-6,500) instead of the bare-metal one.
+## Phase 3 — Horizontal scale-out, static (in progress)
+
+**Setup:** three containers (`surgeP1`/`surgeP2`/`surgeP3`), each pinned to a distinct physical core via `cpuset: "0"/"1"/"2"` in `docker-compose.yml` (affinity-based, not CFS-quota-based `cpus:` — confirmed each container's log reports `GOMAXPROCS=1`, meaning Go itself only sees one core, avoiding CFS-throttling jitter). No nginx yet — each container independently reachable on its own host port (8080/8081/8082) for isolated per-core measurement.
+
+**Per-core ceiling ramp (surgeP1, core 0):**
+
+| Offered rate | Achieved throughput | mean | p99 | max | Success |
+|---|---|---|---|---|---|
+| 1,000 | 999.84 | 2.1ms | 27.7ms | 52.1ms | 100% |
+| 1,200 | 1,199.97 | 7.9ms | 63.0ms | 85.4ms | 100% |
+| 1,300 | ~1,262 (already collapsing) | 202.2ms | 257.1ms | 310.8ms | 100% |
+
+**Per-core ceiling: ~1,200 req/sec.** Notably sharper collapse than the multi-core (8-visible-core) tests — clean at 1,200, fully collapsed by 1,300 (25x latency jump in a 100 req/sec step). Consistent with basic queueing theory: a single-server queue (`GOMAXPROCS=1`, no other core to absorb burstiness) has almost no gradual-degradation zone compared to a multi-server pool — once arrival rate exceeds single-core service rate, queue delay blows up almost immediately rather than tapering off.
+
+**Back-of-envelope validation:** the project brief's initial guess was ~5k req/sec/core. Measured reality is **~1,200 req/sec/core** — about 4x lower than assumed. If perfectly linear, 3 cores/containers would suggest a combined ceiling around **~3,600 req/sec** — this is the number to check the upcoming nginx-balanced test against (Phase 3's real question: does horizontal scale-out actually deliver close to linear scaling, or does nginx/shared-network overhead eat into it?).
+
+**Parity check across cores — cores are NOT interchangeable.** Tested `surgeP2` (core 1) and `surgeP3` (core 2) at the same 1,300 req/sec rate that collapsed core 0:
+
+| Core | @ 1,300 req/sec mean latency | Verdict |
+|---|---|---|
+| 0 (surgeP1) | 202.2ms | collapsed (matches ~1,200 ceiling found earlier) |
+| 1 (surgeP2) | 2.5ms | clean — handled 1,300+ with no issue |
+| 2 (surgeP3) | 210.7ms | collapsed |
+
+2 of 3 sampled cores show the ~1,200 ceiling; core 1 is a clear positive outlier. Root cause not conclusively identified — candidates include the machine's heterogeneous 6-performance/2-efficiency core architecture, core 0 conventionally absorbing a disproportionate share of interrupt/kernel overhead on Linux, and/or Apple's Virtualization Framework (which backs Docker Desktop's Linux VM on macOS) not guaranteeing a stable 1:1 mapping between a container's pinned `cpuset` index and a specific physical core run-to-run. Not fully diagnosable from inside the VM with tools available here. **Treating ~1,200 req/sec/core as the conservative working number** for later math, and flagging that a "good" core isn't guaranteed to stay in the same place if containers are re-pinned later.
+
+**Next:** add nginx in front of all three containers (switching backends from `ports` to `expose`-only) and re-test through nginx's single address to compare actual combined throughput against the ~3,600 theoretical linear estimate (3 × ~1,200) — keeping in mind the per-core parity issue means real combined throughput could land anywhere from below to above that estimate depending on which physical cores the three containers actually land on.
 
 **Notes on methodology:** back-to-back high-concurrency vegeta runs without a cooldown pause between them produced misleadingly worse numbers (client-side ephemeral port exhaustion from TCP `TIME_WAIT`, plus possible leftover queued connections on the server from the prior overload). Always allow ~30-60s between heavy load-test runs, and scale vegeta's `-max-workers`/`-connections` with the offered rate (roughly `rate × expected_latency`) so the load-test client itself doesn't become the bottleneck being measured.

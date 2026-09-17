@@ -1,8 +1,27 @@
 services:
-  surge:
+  surge-1:
     image: surge
     container_name: surgeP1
+    cpuset: "0"
     build: 
       context: .
     ports:
       - "8080:8080"
+
+  surge-2:
+    image: surge
+    container_name: surgeP2
+    cpuset: "1"
+    build: 
+      context: .
+    ports:
+      - "8081:8080"
+
+  surge-3:
+    image: surge
+    container_name: surgeP3
+    cpuset: "2"
+    build: 
+      context: .
+    ports:
+      - "8082:8080"

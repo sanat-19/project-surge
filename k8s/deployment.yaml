@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: surge
+spec:
+  replicas: 1
+
+  selector:
+    matchLabels:
+      app: surge
+  template:
+    metadata:
+      labels:
+        app: surge
+    spec:
+      containers:
+        - name: surge-ctr
+          image: surge
+          imagePullPolicy: Never
+          env:
+            - name: GOMAXPROCS
+              value: "1"
+          ports:
+            - containerPort: 8080
+          resources:
+            limits:
+              cpu: "1"
+            requests:
+              cpu: "1"

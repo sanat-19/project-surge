@@ -72,9 +72,11 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	// Explicit rather than relying on the implicit default, so the value is
-	// provable/loggable instead of assumed.
-	runtime.GOMAXPROCS(runtime.NumCPU())
+	// No explicit runtime.GOMAXPROCS() call here -- Go's runtime already
+	// reads the GOMAXPROCS env var at startup if set, and only falls back
+	// to NumCPU() otherwise. In a container with a CPU limit, NumCPU()
+	// reports the host's total cores, not the limit, so the env var (set
+	// per-deployment) is what should actually control this.
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/work", workHandler)

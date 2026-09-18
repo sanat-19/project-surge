@@ -151,6 +151,53 @@ Retested at the same offered rate (20,000 req/sec) as the worst Phase 0 case:
 | Phase 3 (per-core, isolated) | ~1,200 req/sec/core | Cores not interchangeable (heterogeneous P/E cores and/or VM scheduling variance); ~4x below the ~5k/core back-of-envelope guess | Measured empirically, corrected the estimate |
 | Phase 3 (3 containers + nginx) | ~2,500 req/sec | nginx default `worker_connections` (512) too low; nginx competing for CPU with pinned backend cores; round-robin bounded by weakest backend | `worker_connections`/`worker_processes` tuning; pinned nginx to its own core; documented round-robin's weakest-link limitation |
 
-**Next (Phase 4):** introduce the naive autoscaler — poll → threshold → spin up/down containers automatically, and expect to find the reaction-lag bottleneck the project brief predicts.
+## Phase 4 — Naive autoscaler (attempt 1, abandoned — see Kubernetes section below)
 
-**Notes on methodology:** back-to-back high-concurrency vegeta runs without a cooldown pause between them produced misleadingly worse numbers (client-side ephemeral port exhaustion from TCP `TIME_WAIT`, plus possible leftover queued connections on the server from the prior overload). Always allow ~30-60s between heavy load-test runs, and scale vegeta's `-max-workers`/`-connections` with the offered rate (roughly `rate × expected_latency`) so the load-test client itself doesn't become the bottleneck being measured.
+**Setup:** a separate Go program (`autoscaler/main.go`) using the Docker Engine API (`github.com/docker/docker/client`) to poll each `surgeP*` container's request rate every 5 seconds and log a scale-up/scale-down decision (no actual scaling actions wired in yet — decision logic first, per the incremental plan). Since backends are only reachable inside the Docker network (not from the host), the autoscaler reads each container's own `/metrics` by running `wget` *inside* the container via the Docker exec API, rather than requiring host network access.
+
+**Bug found while testing: nginx caches upstream DNS resolution at startup, not per-request.** After `docker compose up -d` recreated `surgeP2`/`surgeP3` (giving them new internal Docker network IPs) while `nginx` kept running from before, all traffic silently funneled to `surgeP1` alone — the other two showed exactly 0 req/sec despite nginx's config being unchanged and correct. Root cause: nginx resolves `upstream` hostnames to IP addresses once at startup and caches them for the worker process's lifetime; when a container behind one of those hostnames is recreated (new container = new IP, even with the same name), nginx keeps sending traffic to the old, now-dead IP until nginx itself is restarted or reloaded. This is a well-known nginx+Docker gotcha, not a bug in the config we wrote. **Fix applied:** `docker compose restart nginx` after any backend container is recreated — confirmed fixed (even ~830 req/sec split across all three afterward). **This is directly relevant to the coming autoscaler work**: every time the autoscaler creates or destroys a container, nginx's config needs to be rewritten *and reloaded* (`nginx -s reload`) to pick up the change — simply changing the upstream list on disk without a reload will silently fail exactly like this.
+
+**Direction change:** the custom Go autoscaler above was abandoned mid-build in favor of Kubernetes + HPA (Horizontal Pod Autoscaler) — a deliberate scope change, not a dead end. The nginx DNS-caching bug found above is still valid, tech-agnostic knowledge. The Docker/nginx/compose stack (Phases 0-3) stays as the permanent baseline for comparison; Kubernetes is a parallel setup, not a replacement of it.
+
+## Phase 4 — Kubernetes + HPA (replaces the custom autoscaler)
+
+**Setup:** `minikube` (Docker driver — the "node" is itself a `kicbase` Docker container running its own containerd + Kubernetes control plane), `--cpus=4 --memory=4096`. Same `surge` image, loaded into minikube's separate image store via `minikube image load` (host Docker Desktop and minikube run entirely separate container runtimes). A `Deployment` (1 core CPU request/limit per pod, matching the `cpuset` methodology from Phase 3), a `NodePort` `Service` (replaces nginx's round-robin job — `kube-proxy` load-balances natively across whatever Pods currently match the label selector, with no stale-IP-caching problem the way nginx had), and an `HPA` (min 1, max 4 replicas, target 30% CPU utilization for the main test).
+
+**Bug found: metrics-server can't read CPU stats out of the box on minikube.** `kubectl get hpa` showed `cpu: <unknown>/30%` indefinitely. Root cause: metrics-server rejects the kubelet's self-signed TLS certificate by default. **Fix:** patched the metrics-server Deployment to add `--kubelet-insecure-tls`:
+```
+kubectl patch deployment metrics-server -n kube-system --type='json' -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--kubelet-insecure-tls"}]'
+```
+
+**Bug found: Go's `GOMAXPROCS` auto-detection is wrong inside a CPU-limited pod.** `main.go` called `runtime.GOMAXPROCS(runtime.NumCPU())` at startup; inside the pod this reported `8` (the Node's total cores), not `1` (the pod's actual `resources.limits.cpu`). Root cause: Kubernetes enforces CPU limits via CFS quota (a time-slice cap), not by restricting which CPUs are visible to the process the way Docker's `cpuset` did in Phase 3 — so `NumCPU()`-based auto-detection sees the whole Node and is misleading. **Fix:** removed the explicit `runtime.GOMAXPROCS()` call from `main.go` (Go's runtime already honors a `GOMAXPROCS` env var at startup if one is set) and added `env: GOMAXPROCS: "1"` to the Deployment — confirmed via pod logs afterward (`GOMAXPROCS=1`).
+
+**HPA scaling behavior, observed live:** fired `vegeta attack -rate=1500 -duration=120s` at a single starting pod (target 30% CPU, max 3 replicas).
+
+| Time | CPU% (actual/target) | Replicas |
+|---|---|---|
+| T+0s | 0%/30% | 1 |
+| T+63s | 100%/30% | 1 |
+| T+78s | 100%/30% | **3** |
+| T+93s | 44%/30% | 3 |
+| T+180s (load stopped) | 0%/30% | 3 (unchanged) |
+
+**Reaction lag: ~75-80 seconds** from load starting to full scale-out. **It does not scale one pod at a time** — it jumped straight from 1 to 3 in a single step, because HPA computes `desiredReplicas = ceil(currentReplicas × currentCPU% ÷ targetCPU%) = ceil(1 × 100 ÷ 30) = 4`, then caps it at `maxReplicas`. **Scale-down did not happen immediately** after load stopped — HPA has a default ~5 minute stabilization window before removing replicas, specifically to avoid flapping on a brief dip.
+
+**Gotcha: manually scaling a Deployment under active HPA doesn't stick** — `kubectl scale`/editing `replicas:` directly gets overwritten by HPA on its next 15-second reconcile.
+
+**Gotcha: too-aggressive HPA targets scale on noise, not real load.** Raising `maxReplicas` to 4 and lowering the target to 10% caused an immediate jump to 4 replicas with no load test running at all — ordinary baseline CPU (health checks, metrics scraping) was enough to look like ">10%" of a 1-core request.
+
+**Final result — fixed vs. autoscaled, same load test** (`rate=1500, duration=120s`, correctly sized vegeta `-max-workers`/`-connections` this time — first attempt at both showed near-identical throughput because vegeta's own worker cap was the actual bottleneck in both runs, not the pods; a repeat of the same client-side self-throttling trap from Phase 0):
+
+| | Fixed at 1 pod | Autoscaled (up to 4 pods) |
+|---|---|---|
+| throughput | 1,048.30 | **1,499.42** (full offered rate) |
+| mean latency | 472.7ms | **2.5ms** (~190x better) |
+| p99 | 2.75s | **12.3ms** (~224x better) |
+| max | 5.8s | 165ms |
+| success | 100% | 100% |
+
+This is the core Phase 4 deliverable: a fixed pod count collapses under load it can't handle (massive queueing, seconds-long tail latency); the same load against an autoscaled pool resolves to near-instant responses once extra capacity comes online.
+
+**Notes on methodology:** back-to-back high-concurrency vegeta runs without a cooldown pause between them produced misleadingly worse numbers (client-side ephemeral port exhaustion from TCP `TIME_WAIT`, plus possible leftover queued connections on the server from the prior overload). Always allow ~30-60s between heavy load-test runs, and scale vegeta's `-max-workers`/`-connections` with the offered rate (roughly `rate × expected_latency`) so the load-test client itself doesn't become the bottleneck being measured — this bit us twice in Phase 4 alone.
+
+**Separate finding: the local host-to-cluster testing path has its own ceiling, well below the pods' real capacity.** Two dev-only bridging tools were tried to reach the Service from the host: `minikube service --url` (a lightweight local proxy — broke completely above ~3,000-3,500 req/sec, with mass `connection reset by peer` errors and the tunnel process itself becoming unusable, needing a restart) and `kubectl port-forward service/surge` (which turned out to forward to **one single pod**, not load-balanced across the pool at all — a well-known kubectl gotcha, confirmed when 4 running pods produced identical single-pod-overload latency under load). Neither of these reflects a Kubernetes/pod limitation — they're both host-side dev conveniences never meant for real load testing. Measured ceiling of the `minikube service --url` path specifically: clean at 3,000 req/sec, collapsed at 4,000. **The correct way to properly load test a Service's real combined capacity is to run the load generator from inside the cluster** (hitting the Service's internal DNS name, going through actual kube-proxy load-balancing) — not yet done here; flagged as a gap if a true multi-thousand req/sec ceiling number for the autoscaled pool is needed later.

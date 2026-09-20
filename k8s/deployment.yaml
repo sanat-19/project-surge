@@ -4,7 +4,6 @@ metadata:
   name: surge
 spec:
   replicas: 1
-
   selector:
     matchLabels:
       app: surge
@@ -15,15 +14,20 @@ spec:
     spec:
       containers:
         - name: surge-ctr
-          image: surge
+          image: surge:latest
           imagePullPolicy: Never
           env:
             - name: GOMAXPROCS
               value: "1"
           ports:
             - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 2
           resources:
-            limits:
-              cpu: "1"
             requests:
-              cpu: "1"
+              cpu: 500m
+            limits:
+              cpu: 500m

@@ -8,11 +8,16 @@ spec:
     kind: Deployment
     name: surge
   minReplicas: 1
-  maxReplicas: 4
+  maxReplicas: 6
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+    scaleDown:
+      stabilizationWindowSeconds: 60
   metrics:
     - type: Resource
       resource:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 10
+          averageUtilization: 65

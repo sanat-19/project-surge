@@ -1,9 +1,21 @@
 services:
+  redis-master:
+    image: redis:7-alpine
+    container_name: redis-master
+    cpus: 1
+    expose:
+      - "6379"
+
   surge-1:
     image: surge
     container_name: surgeP1
-    cpuset: "0"
-    build: 
+    depends_on:
+      - redis-master
+    cpus: 0.5
+    environment:
+      - REDIS_READ_ADDRS=redis-master:6379
+      - GOMAXPROCS=1
+    build:
       context: .
     expose:
       - "8080"
@@ -11,8 +23,13 @@ services:
   surge-2:
     image: surge
     container_name: surgeP2
-    cpuset: "1"
-    build: 
+    depends_on:
+      - redis-master
+    cpus: 0.5
+    environment:
+      - REDIS_READ_ADDRS=redis-master:6379
+      - GOMAXPROCS=1
+    build:
       context: .
     expose:
       - "8080"
@@ -20,20 +37,44 @@ services:
   surge-3:
     image: surge
     container_name: surgeP3
-    cpuset: "2"
-    build: 
+    depends_on:
+      - redis-master
+    cpus: 0.5
+    environment:
+      - REDIS_READ_ADDRS=redis-master:6379
+      - GOMAXPROCS=1
+    build:
+      context: .
+    expose:
+      - "8080"
+
+  surge-4:
+    image: surge
+    container_name: surgeP4
+    depends_on:
+      - redis-master
+    cpus: 0.5
+    environment:
+      - REDIS_READ_ADDRS=redis-master:6379
+      - GOMAXPROCS=1
+    build:
       context: .
     expose:
       - "8080"
 
   nginx:
     image: nginx:alpine
+    container_name: nginx-lb
     ports:
       - "80:80"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
-    cpuset: "3"
+    sysctls:
+      - net.ipv4.ip_local_port_range=1024 65535
+    cpus: 2
     depends_on:
       - surge-1
       - surge-2
       - surge-3
+      - surge-4
+      - redis-master

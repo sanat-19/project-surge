@@ -1,87 +1,70 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
+	"context"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"runtime"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
 )
 
-// intensity is the number of chained sha256 rounds performed per /work request.
-// This is the dial for how expensive each request is.
-const intensity = 5000
+const redisKey = "surge:key"
 
 var (
-	requestsTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "surge_requests_total",
-			Help: "Total number of HTTP requests, by path and status.",
-		},
-		[]string{"path", "status"},
-	)
+	ctx = context.Background()
 
-	requestDuration = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "surge_request_duration_seconds",
-			Help:    "Request duration in seconds, by path.",
-			Buckets: prometheus.DefBuckets,
-		},
-		[]string{"path"},
-	)
-
-	// Label values are fixed per handler, so resolve them once at startup
-	// instead of paying a map lookup on every request.
-	workDuration     = requestDuration.WithLabelValues("/work")
-	workRequestsOK   = requestsTotal.WithLabelValues("/work", "200")
-	healthRequestsOK = requestsTotal.WithLabelValues("/health", "200")
+	redisClient = newRedisClient(redisAddr())
 )
 
-func doWork(rounds int) [32]byte {
-	sum := sha256.Sum256([]byte("surge"))
-	for i := 0; i < rounds; i++ {
-		sum = sha256.Sum256(sum[:])
+func newRedisClient(addr string) *redis.Client {
+	// Explicit pool sizing instead of relying on defaults -- go-redis
+	// opens connections lazily (MinIdleConns defaults to 0), so a sudden
+	// burst of concurrent requests causes a "connection storm" of many
+	// simultaneous new connections (and DNS lookups) at once. Pre-warming
+	// a chunk of idle connections avoids that first-load stampede.
+	return redis.NewClient(&redis.Options{
+		Addr:         addr,
+		PoolSize:     500,
+		MinIdleConns: 50,
+	})
+}
+
+func redisAddr() string {
+	if v := os.Getenv("REDIS_ADDR"); v != "" {
+		return v
 	}
-	return sum
+	return "redis-master:6379"
 }
 
 func workHandler(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	sum := doWork(intensity)
-	workDuration.Observe(time.Since(start).Seconds())
-	workRequestsOK.Inc()
-
-	var buf [2*len(sum) + 1]byte
-	hex.Encode(buf[:2*len(sum)], sum[:])
-	buf[2*len(sum)] = '\n'
-
+	val, err := redisClient.Get(ctx, redisKey).Result()
+	if err != nil {
+		http.Error(w, "redis error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/plain")
-	w.Write(buf[:])
+	fmt.Fprintln(w, val)
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	healthRequestsOK.Inc()
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, "OK")
 }
 
 func main() {
-	// No explicit runtime.GOMAXPROCS() call here -- Go's runtime already
-	// reads the GOMAXPROCS env var at startup if set, and only falls back
-	// to NumCPU() otherwise. In a container with a CPU limit, NumCPU()
-	// reports the host's total cores, not the limit, so the env var (set
-	// per-deployment) is what should actually control this.
+	// Seed the key so /work always has something to fetch. SET is
+	// idempotent here -- safe to run every time a container starts.
+	if err := redisClient.Set(ctx, redisKey, "hello-from-redis", 0).Err(); err != nil {
+		log.Fatalf("failed to seed redis key: %v", err)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/work", workHandler)
 	mux.HandleFunc("/health", healthHandler)
-	mux.Handle("/metrics", promhttp.Handler())
 
 	addr := ":8080"
 	srv := &http.Server{
@@ -92,6 +75,6 @@ func main() {
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	log.Printf("surge listening on %s (intensity=%d, GOMAXPROCS=%d)", addr, intensity, runtime.GOMAXPROCS(0))
+	log.Printf("surge listening on %s (GOMAXPROCS=%d, redis addr=%s)", addr, runtime.GOMAXPROCS(0), redisAddr())
 	log.Fatal(srv.ListenAndServe())
 }
